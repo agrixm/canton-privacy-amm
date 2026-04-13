@@ -1,0 +1,67 @@
+-- Copyright (c) 2024 canton-privacy-amm contributors
+--
+-- SPDX-License-Identifier: Apache-2.0
+
+module AMM.Swap where
+
+import DA.Assert
+
+-- | Identifies which of the two tokens in a pool is being referred to.
+-- This is used to specify the direction of a swap.
+data TokenIdentifier = TokenA | TokenB
+  deriving (Eq, Show, Ord)
+
+-- | Calculates the result of a swap based on the constant product formula (x*y=k).
+--
+-- This function encapsulates the core logic for a swap. It takes the current
+-- pool state and swap details as input, and returns the calculated output amount
+-- along with the new reserve levels for the pool after the swap.
+--
+-- The swap fee is deducted from the input amount before calculating the swap output.
+-- The full input amount (including the portion that becomes the fee) is added to
+-- the pool's reserves, thereby increasing the liquidity and rewarding liquidity providers.
+calculateSwapOutput
+  : Decimal   -- ^ The swap fee (e.g., 0.003 for 0.3%).
+  -> Decimal   -- ^ The current reserve of token A.
+  -> Decimal   -- ^ The current reserve of token B.
+  -> TokenIdentifier -- ^ The token being provided by the trader.
+  -> Decimal   -- ^ The amount of the input token.
+  -> (Decimal, Decimal, Decimal) -- ^ A tuple containing: (amountOut, newReserveA, newReserveB)
+calculateSwapOutput fee reserveA reserveB tokenIn amountIn =
+  let
+    -- Pre-conditions for a valid swap. These ensure the integrity of the calculation.
+    assertMsg "Input amount for a swap must be positive" (amountIn > 0.0)
+    assertMsg "Swap fee must be non-negative" (fee >= 0.0)
+    assertMsg "Swap fee cannot be 100% or more" (fee < 1.0)
+
+    -- Determine which reserve corresponds to the input token and which to the output token.
+    (reserveIn, reserveOut) = case tokenIn of
+      TokenA -> (reserveA, reserveB)
+      TokenB -> (reserveB, reserveA)
+
+    -- The amount of input tokens used for the swap calculation after deducting the fee.
+    amountInWithFee = amountIn * (1.0 - fee)
+
+    -- The constant product invariant: k = x * y.
+    k = reserveIn * reserveOut
+
+    -- The denominator for the output calculation must be positive.
+    -- This is guaranteed if reserves are non-negative and amountIn is positive.
+    -- (reserveIn + amountInWithFee) * newReserveOut = k
+    newReserveInDenominator = reserveIn + amountInWithFee
+    assertMsg "Swap amount is too small or reserves are zero, leading to division by zero" (newReserveInDenominator > 0.0)
+
+    -- Calculate the new reserve for the output token based on the constant product formula.
+    newReserveOut = k / newReserveInDenominator
+
+    -- The amount of the output token to be sent to the trader.
+    amountOut = reserveOut - newReserveOut
+    assertMsg "Swap resulted in an invalid (negative) output amount, possibly due to rounding or insufficient liquidity" (amountOut >= 0.0)
+
+    -- The new reserves for the pool. The full input amount is added to the input reserve,
+    -- effectively growing the pool by the fee amount.
+    (newReserveA, newReserveB) = case tokenIn of
+      TokenA -> (reserveA + amountIn, newReserveOut)
+      TokenB -> (newReserveOut, reserveB + amountIn)
+
+  in (amountOut, newReserveA, newReserveB)
