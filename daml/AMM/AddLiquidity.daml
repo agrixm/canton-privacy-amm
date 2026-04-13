@@ -1,0 +1,92 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module AMM.AddLiquidity where
+
+import DA.Assert
+import DA.Math
+import DA.Set (member)
+import AMM.LPPosition (LPPosition(..))
+import AMM.Pool (Pool(..), quote)
+
+-- | Extends the `Pool` template with the choice to add liquidity.
+template instance Pool where
+  {- |
+  Adds liquidity to the pool.
+  The liquidity provider specifies the desired amounts of `token0` and `token1` to deposit.
+  The actual amounts deposited will maintain the pool's current price ratio.
+  The provider also specifies minimum amounts to protect against slippage.
+  A new `LPPosition` contract is minted to represent the provider's share of the pool.
+  -}
+  choice AddLiquidity
+    : (ContractId Pool, ContractId LPPosition)
+    with
+      lp: Party             -- ^ The party providing the liquidity.
+      amount0Desired: Decimal -- ^ The desired amount of token0 to add.
+      amount1Desired: Decimal -- ^ The desired amount of token1 to add.
+      amount0Min: Decimal     -- ^ The minimum amount of token0 to add (slippage protection).
+      amount1Min: Decimal     -- ^ The minimum amount of token1 to add (slippage protection).
+    controller lp
+    do
+      -- Ensure the liquidity provider is KYC-cleared for this pool.
+      assertMsg "LP_NOT_KYC_CLEARED" (member lp kycParties)
+
+      -- Ensure desired and minimum amounts are positive.
+      assertMsg "AMOUNT_DESIRED_MUST_BE_POSITIVE" (amount0Desired > 0.0 && amount1Desired > 0.0)
+      assertMsg "AMOUNT_MIN_MUST_BE_POSITIVE" (amount0Min > 0.0 && amount1Min > 0.0)
+
+      -- Calculate the actual amounts to deposit based on the pool's current state.
+      let
+        (amount0, amount1) =
+          if reserve0 == 0.0 && reserve1 == 0.0 then
+            -- This is the first liquidity provider. They set the initial price.
+            (amount0Desired, amount1Desired)
+          else
+            -- For subsequent providers, calculate optimal amounts to maintain the price ratio.
+            let
+              amount1Optimal = quote amount0Desired reserve0 reserve1
+            in
+              if amount1Optimal <= amount1Desired then
+                -- `amount0Desired` is the limiting amount.
+                assertMsg "SLIPPAGE_CHECK_FAILED_AMOUNT1" (amount1Optimal >= amount1Min)
+                (amount0Desired, amount1Optimal)
+              else
+                -- `amount1Desired` is the limiting amount.
+                let
+                  amount0Optimal = quote amount1Desired reserve1 reserve0
+                in do
+                  assertMsg "SLIPPAGE_CHECK_FAILED_AMOUNT0" (amount0Optimal >= amount0Min)
+                  -- This assertion should theoretically never fail if quote is correct,
+                  -- but serves as a sanity check.
+                  assertMsg "INTERNAL_ERROR_INCONSISTENT_QUOTE" (amount0Optimal <= amount0Desired)
+                  (amount0Optimal, amount1Desired)
+
+      -- Calculate the amount of liquidity tokens to mint.
+      let
+        liquidityMinted =
+          if totalSupply == 0.0 then
+            -- For the first deposit, liquidity is sqrt(amount0 * amount1).
+            -- This protects the first LP from being immediately arbitraged.
+            sqrt (amount0 * amount1)
+          else
+            -- For subsequent deposits, liquidity is minted proportionally.
+            -- Using `min` handles potential floating point inaccuracies.
+            min (amount0 * totalSupply / reserve0) (amount1 * totalSupply / reserve1)
+
+      assertMsg "ZERO_LIQUIDITY_MINTED" (liquidityMinted > 0.0)
+
+      -- Archive the old pool state and create a new one with updated reserves and total supply.
+      newPoolCid <- create this with
+        reserve0 = reserve0 + amount0
+        reserve1 = reserve1 + amount1
+        totalSupply = totalSupply + liquidityMinted
+
+      -- Create the LP position contract for the provider.
+      -- This contract represents their share in the pool and is used for removing liquidity later.
+      lpPositionCid <- create LPPosition with
+        operator = operator
+        provider = lp
+        poolCid  = newPoolCid
+        liquidity = liquidityMinted
+
+      return (newPoolCid, lpPositionCid)
