@@ -1,0 +1,29 @@
+# Daml & DPM specific
+.daml
+.dpm
+*.dar
+
+# Node.js / TypeScript
+node_modules
+dist
+build
+.env
+.env.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# IDEs
+.idea
+.vscode
+*.iml
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+log/
+logs/
