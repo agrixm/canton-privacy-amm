@@ -1,0 +1,131 @@
+module AMM.RemoveLiquidity where
+
+import DA.Assert
+import DA.Optional
+
+import AMM.Pool (Pool(..), PoolId)
+import AMM.LPPosition (LPPosition(..))
+import Common.Asset (Asset(..), AssetId)
+
+-- This module defines the workflow for removing liquidity from an AMM pool.
+-- It uses a proposal pattern to ensure both the liquidity provider (LP) and the
+-- pool operator authorize the transaction.
+--
+-- Workflow:
+-- 1. An LP, holding an `AMM.LPPosition` contract, creates a `RemoveLiquidityProposal`.
+--    This signifies their intent to withdraw a specific amount of liquidity.
+-- 2. The pool `operator` observes this proposal.
+-- 3. The `operator` accepts the proposal by exercising the `Accept_Remove_Liquidity`
+--    choice on the corresponding `AMM.Pool` contract.
+-- 4. This choice atomically:
+--    a. Calculates the underlying assets (Token A and Token B) to be returned.
+--    b. Updates the pool's reserves and total liquidity.
+--    c. Burns the LP's liquidity shares (either archiving or reducing their `LPPosition`).
+--    d. Creates new `Asset` contracts for the LP, representing their withdrawn funds.
+
+-- | Proposal from a liquidity provider (LP) to withdraw liquidity from a pool.
+-- This contract serves as the LP's signed authorization for the withdrawal.
+template RemoveLiquidityProposal
+  with
+    operator : Party
+      -- ^ The operator of the pool who will fulfill the request.
+    lp : Party
+      -- ^ The liquidity provider making the request.
+    poolCid : ContractId Pool
+      -- ^ The specific pool instance to withdraw from.
+    lpPositionCid : ContractId LPPosition
+      -- ^ The LP's position contract, proving their stake.
+    liquidityToRemove : Decimal
+      -- ^ The amount of LP liquidity units to burn.
+  where
+    signatory lp
+    observer operator
+
+    key (lp, poolCid) : (Party, ContractId Pool)
+    maintainer key._1
+
+    ensure liquidityToRemove > 0.0
+
+    choice RemoveLiquidityProposal_Cancel : ()
+      -- ^ Allows the LP to cancel their request before it's fulfilled.
+      controller lp
+      do archive self
+
+-- | Defines the choice for a pool operator to accept a liquidity removal proposal.
+-- This interface is intended to be implemented on the `AMM.Pool.Pool` template.
+-- Using an interface allows the `Pool` contract to be extended with this
+-- functionality without modifying its original source file.
+interface PoolRemoveLiquidityI where
+  viewtype Pool
+
+  -- | Fulfills a `RemoveLiquidityProposal`.
+  -- The pool operator, acting as asset custodian, executes this choice. The transaction
+  -- is atomic: the pool state and LP position are updated, and assets are created for
+  -- the LP in a single step.
+  -- This model assumes the operator is also the issuer of the assets, which is a common
+  -- pattern in permissioned DeFi environments.
+  choice Accept_Remove_Liquidity
+    : (ContractId Pool, Optional (ContractId LPPosition), ContractId Asset, ContractId Asset)
+      -- ^ Returns the updated pool, the LP's new position (if any), and the withdrawn assets.
+    with
+      proposalCid : ContractId RemoveLiquidityProposal
+    controller view.operator
+    do
+      proposal <- fetch proposalCid
+      lpPosition <- fetch proposal.lpPositionCid
+      let lp = proposal.lp
+
+      -- =================================
+      --           VALIDATIONS
+      -- =================================
+      assertMsg "Proposal is for a different pool" (proposal.poolCid == (coerceContractId self : ContractId Pool))
+      assertMsg "Proposal initiator does not own the LP position" (lp == lpPosition.lp)
+      assertMsg "LP Position contract does not belong to this pool" (lpPosition.poolId == view.id)
+      assertMsg "Cannot remove more liquidity than available in position" (proposal.liquidityToRemove <= lpPosition.liquidity)
+      assertMsg "Pool has no liquidity" (view.totalLiquidity > 0.0)
+
+      -- =================================
+      --           CALCULATIONS
+      -- =================================
+      let amountA = proposal.liquidityToRemove * view.reserveA / view.totalLiquidity
+      let amountB = proposal.liquidityToRemove * view.reserveB / view.totalLiquidity
+
+      -- =================================
+      --          STATE UPDATES
+      -- =================================
+      -- Consume the old proposal, LP position, and pool contracts.
+      archive proposalCid
+      archive proposal.lpPositionCid
+      archive (coerceContractId self)
+
+      -- Create the new, smaller pool.
+      let newPool = view with
+            reserveA = view.reserveA - amountA
+            reserveB = view.reserveB - amountB
+            totalLiquidity = view.totalLiquidity - proposal.liquidityToRemove
+      newPoolCid <- create newPool
+
+      -- Create the new, smaller LP Position if it was a partial withdrawal.
+      let remainingLiquidity = lpPosition.liquidity - proposal.liquidityToRemove
+      newLpPositionCid <-
+        if remainingLiquidity > 0.0 then
+          fmap Some (create lpPosition with liquidity = remainingLiquidity)
+        else
+          pure None
+
+      -- =================================
+      --         ASSET SETTLEMENT
+      -- =================================
+      -- Create the assets representing the withdrawn liquidity for the LP.
+      withdrawnAssetACid <- create Asset with
+        issuer = view.operator
+        owner = lp
+        id = view.tokenA
+        quantity = amountA
+      withdrawnAssetBCid <- create Asset with
+        issuer = view.operator
+        owner = lp
+        id = view.tokenB
+        quantity = amountB
+
+      return (newPoolCid, newLpPositionCid, withdrawnAssetACid, withdrawnAssetBCid)
