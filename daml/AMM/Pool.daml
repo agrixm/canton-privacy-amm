@@ -1,0 +1,224 @@
+module AMM.Pool where
+
+import Daml.Script
+import DA.Assert
+import DA.Math
+import DA.Map (Map)
+import qualified DA.Map as M
+
+-- | Represents the direction of a trade, from the perspective of which token is being sold.
+data Direction = AForB | BForA
+  deriving (Eq, Show, Ord)
+
+-- | The core Automated Market Maker (AMM) pool contract.
+-- It holds reserves of two tokens and allows for swapping and liquidity provision
+-- based on the constant product formula (x * y = k). Fees from swaps are
+-- reinvested into the pool, increasing the value of liquidity providers' shares.
+-- This design is inspired by the Uniswap v2 core contracts.
+template Pool
+  with
+    operator : Party
+      -- ^ The party managing the pool's parameters, like fees.
+    tokenA : Text
+      -- ^ Identifier for the first token in the pair (e.g., "USD_Stablecoin").
+    tokenB : Text
+      -- ^ Identifier for the second token in the pair (e.g., "EUR_Stablecoin").
+    feeTier : Decimal
+      -- ^ The fee percentage charged on swaps, accruing to liquidity providers. E.g., 0.003 for 0.3%.
+    reserveA : Decimal
+      -- ^ The current amount of token A held by the pool.
+    reserveB : Decimal
+      -- ^ The current amount of token B held by the pool.
+    totalLiquidity : Decimal
+      -- ^ The total amount of liquidity shares issued by the pool.
+    lpProviders : Map Party Decimal
+      -- ^ A map tracking the liquidity shares owned by each provider.
+  where
+    signatory operator
+    observer M.keys lpProviders
+
+    -- Enforce invariants for a valid pool state.
+    ensure
+      feeTier >= 0.0 && feeTier < 1.0 &&
+      reserveA >= 0.0 &&
+      reserveB >= 0.0 &&
+      totalLiquidity >= 0.0
+
+    key (operator, tokenA, tokenB, feeTier) : (Party, Text, Text, Decimal)
+    maintainer key._1
+
+    -- | Allows a party to add liquidity to the pool. The user specifies their desired
+    -- | contribution for each token, and the contract calculates the optimal deposit
+    -- | amounts to maintain the current price ratio, using all of one desired amount
+    -- | and a proportional amount of the other.
+    choice AddLiquidity : (ContractId Pool, Decimal, Decimal, Decimal)
+      with
+        provider : Party
+        amountADesired : Decimal
+        amountBDesired : Decimal
+      controller provider
+      do
+        -- Initial liquidity provision. The first provider sets the initial price.
+        if totalLiquidity == 0.0 then do
+          assertMsg "Initial liquidity amounts must be positive"
+            (amountADesired > 0.0 && amountBDesired > 0.0)
+
+          -- The initial liquidity minted is the geometric mean of the initial amounts,
+          -- which protects against arbitrage.
+          let liquidityMinted = sqrt (amountADesired * amountBDesired)
+          assertMsg "Initial liquidity minting resulted in zero" (liquidityMinted > 0.0)
+
+          poolCid <- create this with
+            reserveA = amountADesired
+            reserveB = amountBDesired
+            totalLiquidity = liquidityMinted
+            lpProviders = M.singleton provider liquidityMinted
+          return (poolCid, liquidityMinted, amountADesired, amountBDesired)
+
+        -- Subsequent liquidity provision
+        else do
+          assertMsg "Desired amounts must be positive"
+            (amountADesired > 0.0 && amountBDesired > 0.0)
+          assertMsg "Pool must have reserves to add liquidity"
+            (reserveA > 0.0 && reserveB > 0.0)
+
+          -- Calculate the optimal amount of the other token to maintain the price ratio.
+          let optimalAmountB = amountADesired * reserveB / reserveA
+          let optimalAmountA = amountBDesired * reserveA / reserveB
+
+          -- Determine the actual amounts to add based on which desired amount is the limiting factor.
+          let (amountA, amountB) =
+                if optimalAmountB <= amountBDesired
+                then (amountADesired, optimalAmountB)
+                else (optimalAmountA, amountBDesired)
+
+          assertMsg "Calculated deposit amounts must be positive" (amountA > 0.0 && amountB > 0.0)
+
+          -- Liquidity is minted proportional to the share of the pool being provided.
+          let liquidityMinted = min (amountA * totalLiquidity / reserveA) (amountB * totalLiquidity / reserveB)
+          assertMsg "No liquidity minted" (liquidityMinted > 0.0)
+
+          poolCid <- create this with
+            reserveA = reserveA + amountA
+            reserveB = reserveB + amountB
+            totalLiquidity = totalLiquidity + liquidityMinted
+            lpProviders = M.insertWith (+) provider liquidityMinted lpProviders
+
+          return (poolCid, liquidityMinted, amountA, amountB)
+
+    -- | Allows a liquidity provider to withdraw their proportional share of the pool's assets
+    -- | by burning their liquidity shares.
+    choice RemoveLiquidity : (ContractId Pool, Decimal, Decimal)
+      with
+        provider : Party
+        liquidityToRemove : Decimal
+      controller provider
+      do
+        let currentLiquidity = M.lookupDefault 0.0 provider lpProviders
+        assertMsg "Provider does not have enough liquidity" (currentLiquidity >= liquidityToRemove)
+        assertMsg "Amount of liquidity to remove must be positive" (liquidityToRemove > 0.0)
+        assertMsg "Cannot remove more liquidity than exists in the pool" (totalLiquidity >= liquidityToRemove)
+
+        -- Calculate the amount of each token corresponding to the liquidity being removed.
+        let amountA = liquidityToRemove * reserveA / totalLiquidity
+        let amountB = liquidityToRemove * reserveB / totalLiquidity
+
+        let newProviderLiquidity = currentLiquidity - liquidityToRemove
+
+        -- Update or remove the provider from the map.
+        let newLpProviders =
+              if newProviderLiquidity > 1.0e-10 -- Use a tolerance for floating point comparison
+              then M.insert provider newProviderLiquidity lpProviders
+              else M.delete provider lpProviders
+
+        poolCid <- create this with
+          reserveA = reserveA - amountA
+          reserveB = reserveB - amountB
+          totalLiquidity = totalLiquidity - liquidityToRemove
+          lpProviders = newLpProviders
+
+        return (poolCid, amountA, amountB)
+
+    -- | Swaps an exact amount of an input token for an estimated amount of an output token.
+    -- The output amount is determined by the constant product formula, adjusted for fees.
+    -- The fee is implicitly captured by the pool, increasing its constant product (k).
+    choice Swap : (ContractId Pool, Decimal)
+      with
+        trader : Party
+        direction : Direction
+        amountIn : Decimal
+      controller trader
+      do
+        assertMsg "Input amount must be positive" (amountIn > 0.0)
+        assertMsg "Pool must have liquidity to swap" (reserveA > 0.0 && reserveB > 0.0)
+
+        let (inputReserve, outputReserve) = case direction of
+              AForB -> (reserveA, reserveB)
+              BForA -> (reserveB, reserveA)
+
+        -- The fee is taken from the input amount for the swap calculation.
+        let amountInWithFee = amountIn * (1.0 - feeTier)
+
+        let numerator = amountInWithFee * outputReserve
+        let denominator = inputReserve + amountInWithFee
+        assertMsg "Swap denominator cannot be zero" (denominator /= 0.0)
+
+        let amountOut = numerator / denominator
+        assertMsg "Output amount must be positive" (amountOut > 0.0)
+        assertMsg "Insufficient output liquidity" (amountOut < outputReserve)
+
+        let (newReserveA, newReserveB) = case direction of
+              AForB -> (reserveA + amountIn, reserveB - amountOut)
+              BForA -> (reserveA - amountOut, reserveB + amountIn)
+
+        poolCid <- create this with
+          reserveA = newReserveA
+          reserveB = newReserveB
+
+        return (poolCid, amountOut)
+
+    -- | Allows the operator to change the fee tier for the pool.
+    -- This archives the current pool and creates a new one with the updated fee.
+    -- Note: In a production system, this would likely be governed by a DAO or a time-lock.
+    choice UpdateFeeTier : ContractId Pool
+      with
+        newFeeTier : Decimal
+      controller operator
+      do
+        assertMsg "New fee tier must be between 0% and 100%" (newFeeTier >= 0.0 && newFeeTier < 1.0)
+        create this with feeTier = newFeeTier
+
+-- | A helper script to set up an initial AMM pool for testing purposes.
+setup : Script (ContractId Pool)
+setup = script do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+  lp1 <- allocatePartyWithHint "LP1" (PartyIdHint "lp1")
+
+  let
+    tokenA = "USD"
+    tokenB = "EUR"
+    initialReserveA = 100000.0
+    initialReserveB = 100000.0 -- Initial 1:1 price
+    feeTier = 0.003 -- 0.3%
+
+  -- The operator creates the initial, empty pool.
+  emptyPoolCid <- submit operator do
+    createCmd Pool with
+      operator
+      tokenA
+      tokenB
+      feeTier
+      reserveA = 0.0
+      reserveB = 0.0
+      totalLiquidity = 0.0
+      lpProviders = M.empty
+
+  -- The first liquidity provider seeds the pool.
+  (poolCid, liq, _, _) <- submit lp1 do
+    exerciseCmd emptyPoolCid AddLiquidity with
+      provider = lp1
+      amountADesired = initialReserveA
+      amountBDesired = initialReserveB
+  debug $ "Seeded pool. Minted liquidity: " <> show liq
+
+  return poolCid
