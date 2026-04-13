@@ -1,0 +1,71 @@
+-- | This module defines the shielded Liquidity Provider (LP) position contract,
+-- | which represents a user's stake in an AMM pool within a specific price range.
+module AMM.LPPosition where
+
+import AMM.Pool (Id)
+
+-- | Represents a liquidity provider's position in a specific AMM pool.
+-- This contract is "shielded" in that only the position's owner and the pool
+-- operator can see its details. The lifecycle of this contract (creation,
+-- updates, archival) is managed by choices on the corresponding `Pool` contract.
+template LPPosition
+  with
+    poolId      : Id
+      -- ^ The identifier for the pool this position belongs to.
+    owner       : Party
+      -- ^ The liquidity provider who owns this position.
+    liquidity   : Decimal
+      -- ^ The amount of liquidity in this position, as per the Uniswap v3 specification.
+    tickLower   : Int
+      -- ^ The lower tick of the concentrated liquidity range.
+    tickUpper   : Int
+      -- ^ The upper tick of the concentrated liquidity range.
+    feesOwed0   : Decimal
+      -- ^ The amount of token0 fees owed to the position owner, yet to be collected.
+    feesOwed1   : Decimal
+      -- ^ The amount of token1 fees owed to the position owner, yet to be collected.
+  where
+    signatory owner
+    observer poolId.operator
+
+    key (poolId, owner, tickLower, tickUpper) : (Id, Party, Int, Int)
+    maintainer key._2
+
+    ensure liquidity >= 0.0
+      -- A position can have zero liquidity if it has been fully withdrawn but
+      -- fees are still outstanding. A position with zero liquidity and zero
+      -- fees should be archived by the controlling Pool contract.
+    ensure tickLower < tickUpper
+      -- The lower tick must be strictly less than the upper tick.
+    ensure feesOwed0 >= 0.0
+    ensure feesOwed1 >= 0.0
+
+    -- | Consuming choice exercised by the Pool operator to update the state of the position.
+    -- This is used to reflect changes in liquidity (minting/burning) and to
+    -- accrue fees from swaps. It can also be used to reset owed fees to zero
+    -- after they have been collected via a choice on the `Pool` contract.
+    choice UpdatePosition
+      : ContractId LPPosition
+      with
+        newLiquidity : Decimal
+          -- ^ The new liquidity amount. Can be more, less, or the same.
+        newFeesOwed0 : Decimal
+          -- ^ The new total of fees owed for token0.
+        newFeesOwed1 : Decimal
+          -- ^ The new total of fees owed for token1.
+      controller poolId.operator
+      do
+        -- This choice archives the current LPPosition contract and creates a new one
+        -- with the updated values, effectively changing its state atomically.
+        create this with
+          liquidity = newLiquidity,
+          feesOwed0 = newFeesOwed0,
+          feesOwed1 = newFeesOwed1
+
+    -- | Allows the owner to query the amount of fees owed to their position.
+    -- The actual collection and token transfer must be orchestrated by a choice
+    -- on the `Pool` contract, which has authority over the pool's token holdings.
+    nonconsuming choice ViewFees : (Decimal, Decimal)
+      controller owner
+      do
+        return (feesOwed0, feesOwed1)
