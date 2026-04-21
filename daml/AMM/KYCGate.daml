@@ -1,0 +1,53 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module AMM.KYCGate where
+
+-- | Represents the authority of a `Party` to perform Know-Your-Customer (KYC)
+-- checks and issue credentials. This is a long-lived role contract.
+template KYCProviderRole
+  with
+    provider : Party
+      -- ^ The party authorized to issue KYC credentials.
+  where
+    signatory provider
+
+    key provider : Party
+    maintainer key
+
+    -- | Allows the `provider` to issue a `KYCCredential` to a `customer` party,
+    -- certifying that they have passed the necessary identity verification checks.
+    nonconsuming choice IssueCredential : ContractId KYCCredential
+      with
+        customer : Party
+          -- ^ The party to whom the KYC credential will be issued.
+      controller provider
+      do
+        create KYCCredential with provider, customer
+
+-- | Represents a verifiable credential confirming that a `customer` has been
+-- successfully vetted by a `provider`. The existence of this contract on the
+-- ledger is used by other AMM contracts (e.g., `AMM.Pool`) to gate access
+-- to sensitive operations like swapping or providing liquidity.
+template KYCCredential
+  with
+    provider : Party
+      -- ^ The party that issued this credential.
+    customer : Party
+      -- ^ The party that holds this credential.
+  where
+    signatory provider
+    observer customer
+
+    key (provider, customer) : (Party, Party)
+    maintainer key._1
+
+    -- | Allows the `provider` to revoke the credential. This would typically
+    -- happen if the customer's status changes or they no longer meet the
+    -- KYC requirements. Revoking is achieved by archiving this contract.
+    choice Revoke : ()
+      controller provider
+      do
+        return ()
