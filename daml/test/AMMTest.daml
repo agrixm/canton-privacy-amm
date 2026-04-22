@@ -1,0 +1,155 @@
+module Test.AMMTest where
+
+import Daml.Script
+import DA.Assert
+import DA.Math qualified as Math
+import DA.Next.Set as Set
+
+-- Imports from project modules
+import AMM.LPPosition
+import AMM.Swap
+import AMM.AddLiquidity
+import AMM.RemoveLiquidity
+import AMM.KYCGate
+
+-- | Helper for comparing Decimals with a tolerance.
+-- Useful for results of calculations involving division.
+assertApproxEqual: CanAbort m => Text -> Decimal -> Decimal -> m ()
+assertApproxEqual msg expected actual =
+  let
+    tolerance = 0.00001
+    diff = abs (expected - actual)
+  in
+    assertMsg msg (diff < tolerance)
+
+-- | Main test suite for the AMM.
+ammTests = script do
+
+  test "KYC Gate Rejection: Unauthorized party cannot interact" do
+    -- 1. Setup parties, KYC Gate, and a Pool.
+    operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+    unauthorized <- allocatePartyWithHint "Unauthorized" (PartyIdHint "unauthorized")
+
+    gateCid <- submit operator do
+      createCmd KYCGate with operator, clearedParties = Set.empty
+
+    poolCid <- submit operator do
+      createCmd Pool with
+        operator
+        tokenA = "USD"
+        tokenB = "EUR"
+        reserveA = 0.0
+        reserveB = 0.0
+        totalLPShares = 0.0
+        feeBps = 30
+
+    -- 2. Action & Assertion
+    -- The core security model is that actions like `RequestAddLiquidity` can only be
+    -- initiated by exercising a choice on a `KYCCleared` contract. An unauthorized
+    -- party will not have such a contract.
+    kycContracts <- query @KYCCleared unauthorized
+    assert (null kycContracts) "Unauthorized party must not have a KYCCleared contract."
+
+    -- For a more explicit failure test, we can check that an unauthorized party
+    -- cannot add themselves to the KYC gate, as that choice is controlled by the operator.
+    submitMustFail unauthorized do
+      exerciseCmd gateCid AddParty with partyToAdd = unauthorized
+
+    debug "KYC gate rejection test passed."
+
+
+  test "Core Invariant: Adding and removing liquidity" do
+    -- 1. Setup a KYC-cleared Liquidity Provider and an empty Pool.
+    operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+    lp <- allocatePartyWithHint "LiquidityProvider" (PartyIdHint "lp")
+
+    gateCid <- submit operator do createCmd KYCGate with operator, clearedParties = Set.empty
+    submit operator do exerciseCmd gateCid AddParty with partyToAdd = lp
+    [(lpClearedCid, _)] <- query @KYCCleared lp
+
+    poolCid <- submit operator do
+      createCmd Pool with operator, tokenA = "USD", tokenB = "EUR", reserveA = 0.0, reserveB = 0.0, totalLPShares = 0.0, feeBps = 30
+
+    -- 2. Add initial liquidity and assert the state is correct.
+    let initialA = 1000.0
+    let initialB = 2000.0
+
+    addRequestCid <- submit lp do
+      exerciseCmd lpClearedCid RequestAddLiquidity with poolCid, amountA = initialA, amountB = initialB
+
+    lpPosCid <- submit operator do
+      exerciseCmd addRequestCid ConfirmAddLiquidity
+
+    (lpPosCid', lpPos) <- queryContractId lp lpPosCid
+    (poolCid', pool) <- queryContractId operator poolCid
+
+    let expectedShares = Math.sqrt (initialA * initialB)
+    assertApproxEqual "LP shares calculated incorrectly" expectedShares lpPos.lpShares
+    assertApproxEqual "Pool total LP shares incorrect" expectedShares pool.totalLPShares
+    assertApproxEqual "Pool reserve A incorrect after add" initialA pool.reserveA
+    assertApproxEqual "Pool reserve B incorrect after add" initialB pool.reserveB
+
+    -- 3. Remove all liquidity and assert the final state is correct.
+    removeRequestCid <- submit lp do exerciseCmd lpPosCid RequestRemoveLiquidity with sharesToRemove = lpPos.lpShares
+    removalConfirmCid <- submit operator do exerciseCmd removeRequestCid ConfirmRemoveLiquidity
+    (removalConfirmCid', removal) <- queryContractId lp removalConfirmCid
+
+    assertApproxEqual "Amount A returned is incorrect" initialA removal.amountAReturned
+    assertApproxEqual "Amount B returned is incorrect" initialB removal.amountBReturned
+
+    (_, finalPool) <- queryContractId operator poolCid
+    assert (finalPool.reserveA == 0.0) "Pool reserve A should be zero"
+    assert (finalPool.reserveB == 0.0) "Pool reserve B should be zero"
+    assert (finalPool.totalLPShares == 0.0) "Pool total shares should be zero"
+
+    optionalLpPos <- queryContractIdOptional lp lpPosCid
+    assert (isNone optionalLpPos) "LP Position contract should be archived after full removal"
+    debug "Liquidity add/remove test passed."
+
+
+  test "Swap Calculation: Swapping respects x*y=k and fees" do
+    -- 1. Setup: Create a pool with initial liquidity from a KYC'd LP.
+    operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+    lp <- allocatePartyWithHint "LiquidityProvider" (PartyIdHint "lp")
+    trader <- allocatePartyWithHint "Trader" (PartyIdHint "trader")
+
+    gateCid <- submit operator do createCmd KYCGate with operator, clearedParties = Set.empty
+    submit operator do exerciseCmd gateCid AddParty with partyToAdd = lp
+    submit operator do exerciseCmd gateCid AddParty with partyToAdd = trader
+    [(lpClearedCid, _)] <- query @KYCCleared lp
+    [(traderClearedCid, _)] <- query @KYCCleared trader
+
+    poolCid <- submit operator do
+      createCmd Pool with operator, tokenA = "USD", tokenB = "EUR", reserveA = 0.0, reserveB = 0.0, totalLPShares = 0.0, feeBps = 30
+
+    addRequestCid <- submit lp do
+      exerciseCmd lpClearedCid RequestAddLiquidity with poolCid, amountA = 1000.0, amountB = 1000.0
+
+    submit operator do exerciseCmd addRequestCid ConfirmAddLiquidity
+
+    -- 2. Action: Trader swaps 100 USD for EUR.
+    let amountIn = 100.0
+    swapRequestCid <- submit trader do
+      exerciseCmd traderClearedCid RequestSwap with poolCid, tokenIn = "USD", amountIn
+
+    swapConfirmCid <- submit operator do
+      exerciseCmd swapRequestCid ConfirmSwap
+    (_, swapConfirm) <- queryContractId trader swapConfirmCid
+
+    -- 3. Assertions: Verify output amount and final pool state.
+    -- Initial state: reserveUSD = 1000, reserveEUR = 1000, k = 1,000,000
+    -- Fee: 0.3% (30 bps)
+    -- amountInAfterFee = 100.0 * (1 - 0.003) = 99.7
+    -- newReserveUSD = 1000 + 100 = 1100
+    -- newReserveEUR = k / (oldReserveUSD + amountInAfterFee)
+    --               = 1,000,000 / (1000 + 99.7) = 1,000,000 / 1099.7 ~= 909.33899245
+    -- amountOutEUR = oldReserveEUR - newReserveEUR
+    --              = 1000 - 909.33899245 = 90.66100755
+    let expectedAmountOut = 90.66100755
+    assertApproxEqual "Swap output amount is incorrect" expectedAmountOut swapConfirm.amountOut
+
+    (_, finalPool) <- queryContractId operator poolCid
+    let expectedNewReserveB = 909.33899245
+    assertApproxEqual "Pool reserve A not updated correctly" 1100.0 finalPool.reserveA
+    assertApproxEqual "Pool reserve B not updated correctly" expectedNewReserveB finalPool.reserveB
+    debug "Swap calculation test passed."
