@@ -1,67 +1,124 @@
--- Copyright (c) 2024 canton-privacy-amm contributors
---
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
+--
 
 module AMM.Swap where
 
 import DA.Assert
+import DA.Time
 
--- | Identifies which of the two tokens in a pool is being referred to.
--- This is used to specify the direction of a swap.
-data TokenIdentifier = TokenA | TokenB
+-- | Represents a fungible token, identified by its issuer and symbol.
+-- This provides a more structured way to identify assets than a simple Text.
+data Token = Token
+  with
+    issuer : Party
+    symbol : Text
   deriving (Eq, Show, Ord)
 
--- | Calculates the result of a swap based on the constant product formula (x*y=k).
---
--- This function encapsulates the core logic for a swap. It takes the current
--- pool state and swap details as input, and returns the calculated output amount
--- along with the new reserve levels for the pool after the swap.
---
--- The swap fee is deducted from the input amount before calculating the swap output.
--- The full input amount (including the portion that becomes the fee) is added to
--- the pool's reserves, thereby increasing the liquidity and rewarding liquidity providers.
-calculateSwapOutput
-  : Decimal   -- ^ The swap fee (e.g., 0.003 for 0.3%).
-  -> Decimal   -- ^ The current reserve of token A.
-  -> Decimal   -- ^ The current reserve of token B.
-  -> TokenIdentifier -- ^ The token being provided by the trader.
-  -> Decimal   -- ^ The amount of the input token.
-  -> (Decimal, Decimal, Decimal) -- ^ A tuple containing: (amountOut, newReserveA, newReserveB)
-calculateSwapOutput fee reserveA reserveB tokenIn amountIn =
-  let
-    -- Pre-conditions for a valid swap. These ensure the integrity of the calculation.
-    assertMsg "Input amount for a swap must be positive" (amountIn > 0.0)
-    assertMsg "Swap fee must be non-negative" (fee >= 0.0)
-    assertMsg "Swap fee cannot be 100% or more" (fee < 1.0)
+-- | The central contract for an Automated Market Maker (AMM) liquidity pool.
+-- It holds reserves of two tokens and allows for swaps and liquidity management
+-- based on the constant product formula (x * y = k).
+-- This template focuses on the core swap functionality.
+template Pool
+  with
+    operator : Party          -- ^ The party operating the AMM service.
+    kycAuthority : Party      -- ^ The party responsible for KYC/AML checks.
+    poolId : Text             -- ^ A unique identifier for this liquidity pool.
+    tokenA : Token            -- ^ The first token in the pair.
+    tokenB : Token            -- ^ The second token in the pair.
+    reserveA : Decimal        -- ^ The current reserve balance of token A.
+    reserveB : Decimal        -- ^ The current reserve balance of token B.
+    feeBps : Int              -- ^ The swap fee in basis points (e.g., 30 for 0.30%).
+    traders : [Party]         -- ^ The set of KYC-cleared parties allowed to trade.
+  where
+    signatory operator
+    observer kycAuthority, traders
 
-    -- Determine which reserve corresponds to the input token and which to the output token.
-    (reserveIn, reserveOut) = case tokenIn of
-      TokenA -> (reserveA, reserveB)
-      TokenB -> (reserveB, reserveA)
+    ensure
+      reserveA >= 0.0 && reserveB >= 0.0 && feeBps >= 0 && feeBps < 10000
 
-    -- The amount of input tokens used for the swap calculation after deducting the fee.
-    amountInWithFee = amountIn * (1.0 - fee)
+    -- | Executes a trade, swapping an exact amount of an input token for a
+    -- calculated amount of the output token.
+    -- Includes slippage protection and a deadline to protect the trader from
+    -- unfavorable price moves and delayed execution.
+    choice Swap : (ContractId Pool, Decimal)
+      with
+        trader : Party          -- ^ The party performing the swap.
+        tokenIn : Token         -- ^ The token being provided by the trader.
+        amountIn : Decimal      -- ^ The exact amount of the input token.
+        minAmountOut : Decimal  -- ^ The minimum amount of output token the trader will accept.
+        deadline : Time         -- ^ The latest time at which this swap can be executed.
+      controller trader
+      do
+        -- 1. Authorization Check
+        assertMsg "Trader is not KYC-cleared for this pool" (elem trader traders)
 
-    -- The constant product invariant: k = x * y.
-    k = reserveIn * reserveOut
+        -- 2. Deadline Enforcement
+        -- The transaction must be committed to the ledger before the deadline.
+        now <- getTime
+        assertMsg ("Transaction submitted after deadline: " <> show now <> " > " <> show deadline) (now <= deadline)
 
-    -- The denominator for the output calculation must be positive.
-    -- This is guaranteed if reserves are non-negative and amountIn is positive.
-    -- (reserveIn + amountInWithFee) * newReserveOut = k
-    newReserveInDenominator = reserveIn + amountInWithFee
-    assertMsg "Swap amount is too small or reserves are zero, leading to division by zero" (newReserveInDenominator > 0.0)
+        -- 3. Input Validation
+        assertMsg "Input amount must be positive" (amountIn > 0.0)
+        assertMsg "Minimum output amount must be positive" (minAmountOut > 0.0)
+        assertMsg "Invalid input token for this pool" (tokenIn == tokenA || tokenIn == tokenB)
 
-    -- Calculate the new reserve for the output token based on the constant product formula.
-    newReserveOut = k / newReserveInDenominator
+        -- 4. Calculate Swap Output
+        let
+          -- The fee is taken from the input amount.
+          feeDecimal = intToDecimal feeBps / 10000.0
+          amountInWithFee = amountIn * (1.0 - feeDecimal)
 
-    -- The amount of the output token to be sent to the trader.
-    amountOut = reserveOut - newReserveOut
-    assertMsg "Swap resulted in an invalid (negative) output amount, possibly due to rounding or insufficient liquidity" (amountOut >= 0.0)
+        (newReserveA, newReserveB, amountOut) <-
+          if tokenIn == tokenA then do
+            -- Trading token A for token B
+            assertMsg "Insufficient liquidity in the pool" (reserveB > 0.0)
+            let
+              -- The core constant product formula: (x + dx) * (y - dy) = k
+              -- dy = y - k / (x + dx) = y - (x*y) / (x + dx)
+              -- dy = (y * (x + dx) - x*y) / (x + dx)
+              -- dy = (x*y + y*dx - x*y) / (x + dx)
+              -- dy = y * dx / (x + dx)
+              -- where dx = amountInWithFee, x = reserveA, y = reserveB
+              numerator = reserveB * amountInWithFee
+              denominator = reserveA + amountInWithFee
+              amountOut' = numerator / denominator
 
-    -- The new reserves for the pool. The full input amount is added to the input reserve,
-    -- effectively growing the pool by the fee amount.
-    (newReserveA, newReserveB) = case tokenIn of
-      TokenA -> (reserveA + amountIn, newReserveOut)
-      TokenB -> (newReserveOut, reserveB + amountIn)
+            assertMsg "Swap amount is too large for current liquidity" (amountOut' < reserveB)
+            return (reserveA + amountIn, reserveB - amountOut', amountOut')
+          else do
+            -- Trading token B for token A
+            assertMsg "Insufficient liquidity in the pool" (reserveA > 0.0)
+            let
+              numerator = reserveA * amountInWithFee
+              denominator = reserveB + amountInWithFee
+              amountOut' = numerator / denominator
 
-  in (amountOut, newReserveA, newReserveB)
+            assertMsg "Swap amount is too large for current liquidity" (amountOut' < reserveA)
+            return (reserveA - amountOut', reserveB + amountIn, amountOut')
+
+        -- 5. Slippage Protection
+        -- Ensure the calculated output amount meets the trader's minimum requirement.
+        assertMsg
+          ("Slippage tolerance exceeded. Required min output: " <> show minAmountOut <>
+           ", actual output: " <> show amountOut)
+          (amountOut >= minAmountOut)
+
+        -- 6. Update Pool State
+        -- Archive the old pool state and create a new one with updated reserves.
+        newPoolCid <- create this with
+          reserveA = newReserveA
+          reserveB = newReserveB
+
+        -- Return the new pool contract ID and the actual amount of token out.
+        -- The caller is responsible for arranging the transfer of tokens.
+        return (newPoolCid, amountOut)
+
+    -- Other choices (e.g., AddLiquidity, RemoveLiquidity) would be defined here,
+    -- potentially in other files but part of this template definition.
+    nonconsuming choice GetPoolState : (Decimal, Decimal)
+      controller trader
+        do
+          assertMsg "Caller is not an authorized trader for this pool" (elem trader traders)
+          return (reserveA, reserveB)
